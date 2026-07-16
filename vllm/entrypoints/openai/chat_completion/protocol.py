@@ -790,9 +790,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not directives:
             return data
         # Sort by token start position; ties broken by original order.
+        # covers_output directives carry no start and apply past the prompt
+        # (deepest region), so they sort last.
         sorted_directives = sorted(
             enumerate(directives),
-            key=lambda pair: (pair[1].get("start", 0), pair[0]),
+            key=lambda pair: (
+                float("inf")
+                if pair[1].get("covers_output")
+                else pair[1].get("start", 0),
+                pair[0],
+            ),
         )
         prev_priority: int | None = None
         prev_start: int | None = None

@@ -668,6 +668,18 @@ class BlockPool:
         scope = extra.get("retention_scope")
         if directives is None and scope is None:
             return
+        # The client cannot know the generated output's length at request
+        # time, so a `covers_output` directive carries no range; resolve it
+        # to [num_prompt_tokens, None) — exactly the blocks past the prompt.
+        if directives:
+            num_prompt_tokens = getattr(request, "num_prompt_tokens", None)
+            resolved: list[dict] = []
+            for d in directives:
+                if d.get("covers_output") and num_prompt_tokens is not None:
+                    resolved.append({**d, "start": num_prompt_tokens, "end": None})
+                else:
+                    resolved.append(d)
+            directives = resolved
         self.priority_eviction_queue.apply_directives(
             blocks[:num_full_blocks],
             directives or [],

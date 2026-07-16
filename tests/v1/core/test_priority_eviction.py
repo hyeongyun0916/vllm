@@ -548,6 +548,40 @@ class TestBlockPoolPriorityEviction:
         assert meta.priority == 80
         assert meta.scope == "alice"
 
+    def test_covers_output_directive_protects_only_output_blocks(self):
+        """A `covers_output` directive carries no range — the client cannot
+        know the generated output length at request time. The hook resolves it
+        to [num_prompt_tokens, None) so it protects exactly the blocks past the
+        prompt (the generated output) and leaves the prompt blocks untouched."""
+        from vllm.sampling_params import SamplingParams
+
+        pool = self._make_pool(num_blocks=8, block_size=16)
+        sampling = SamplingParams(
+            extra_args={
+                "retention_directives": [{"covers_output": True, "priority": 50}],
+            }
+        )
+
+        class _Req:
+            sampling_params: SamplingParams
+            num_prompt_tokens: int
+
+        request = _Req()
+        request.sampling_params = sampling
+        request.num_prompt_tokens = 32  # 2 prompt blocks: [0,16) [16,32)
+
+        # idx 0..3 map to token ranges [0,16) [16,32) [32,48) [48,64).
+        blocks = [pool.blocks[i] for i in (1, 2, 3, 4)]
+        pool._apply_retention_hook(request, blocks, num_full_blocks=4, block_size=16)
+
+        q = pool.priority_eviction_queue
+        # Prompt blocks (positions < 32) stay unprotected.
+        assert q._meta.get(blocks[0].block_id) is None
+        assert q._meta.get(blocks[1].block_id) is None
+        # Output blocks (positions >= 32) are protected at the given priority.
+        assert q._meta.get(blocks[2].block_id).priority == 50
+        assert q._meta.get(blocks[3].block_id).priority == 50
+
     def test_no_extra_args_zero_overhead_path(self):
         from vllm.sampling_params import SamplingParams
 
@@ -765,7 +799,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((42).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
@@ -824,7 +858,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((77).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
         pool.free_blocks([block])
         # Block is now in LRU with cache map entry intact.
@@ -867,7 +901,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_old = BlockHash((123).to_bytes(32, "little"))
         h_old = make_block_hash_with_group_id(raw_old, 0)
-        block.block_hash = h_old
+        block.set_block_hash(h_old)
         pool.cached_block_hash_to_block.insert(h_old, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
@@ -951,7 +985,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((321).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)

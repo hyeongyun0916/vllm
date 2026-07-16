@@ -242,6 +242,31 @@ def test_retention_directives_single_directive_is_valid():
     _build_request_with_directives([{"start": 0, "end": 16, "priority": 80}])
 
 
+def test_retention_directives_covers_output_valid():
+    # A covers_output directive carries no start/end; it applies past the
+    # prompt (the deepest region), so the validator sorts it last. A shallower
+    # prompt directive with higher priority followed by a lower-priority output
+    # flag is non-increasing across depth: valid.
+    _build_request_with_directives(
+        [
+            {"start": 0, "end": 100, "priority": 90},
+            {"covers_output": True, "priority": 50},
+        ]
+    )
+
+
+def test_retention_directives_covers_output_higher_priority_rejected():
+    # Output is the deepest region; it must not out-rank a shallower prompt
+    # directive (prefix-cache non-increasing constraint).
+    with pytest.raises(ValueError, match="non-increasing"):
+        _build_request_with_directives(
+            [
+                {"start": 0, "end": 100, "priority": 50},
+                {"covers_output": True, "priority": 80},  # deeper + higher: invalid
+            ]
+        )
+
+
 def test_retention_directives_increasing_priority_rejected():
     with pytest.raises(ValueError, match="non-increasing"):
         _build_request_with_directives(
