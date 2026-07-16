@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -200,6 +201,11 @@ class BlockPool:
         # Sidecar storage for priority-based KV-cache eviction (empty until a
         # retention directive is applied).
         self.priority_eviction_queue = PriorityEvictionQueue()
+        # Fail-safe: protections beyond the budget degrade to plain LRU so
+        # the protected pool cannot squeeze the working set into thrash.
+        self.retention_budget_blocks = int(
+            num_gpu_blocks * envs.VLLM_RETENTION_BUDGET_FRAC
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -802,10 +808,14 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 # Protected blocks go to the priority queue; try_insert
                 # returns False for the rest, which fall through to LRU.
-                if self.priority_eviction_queue.try_insert(
-                    block, last_freed_time=now + pos * 1e-9
-                ):
-                    continue
+                # Over budget: drop the protection (stale metadata must not
+                # survive reallocation) and compete in plain LRU.
+                pq = self.priority_eviction_queue
+                if pq.num_blocks < self.retention_budget_blocks:
+                    if pq.try_insert(block, last_freed_time=now + pos * 1e-9):
+                        continue
+                else:
+                    pq.unprotect(block.block_id)
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
                 else:
