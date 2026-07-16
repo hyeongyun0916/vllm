@@ -792,15 +792,19 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (will never match in APC)
         blocks_with_hash = []
         blocks_without_hash = []
-        # Stamp the current monotonic time so the priority-queue heap tiebreak
-        # reflects this most-recent free.
+        # Free-time heap tiebreak: the per-position nanosecond offset makes
+        # pop_lowest drain tail-first (prefix head last), matching the LRU
+        # free-list order; ~1e-9*n is far below real inter-free gaps, so
+        # cross-request recency is unaffected.
         now = time.monotonic()
-        for block in ordered_blocks:
+        for pos, block in enumerate(ordered_blocks):
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 # Protected blocks go to the priority queue; try_insert
                 # returns False for the rest, which fall through to LRU.
-                if self.priority_eviction_queue.try_insert(block, last_freed_time=now):
+                if self.priority_eviction_queue.try_insert(
+                    block, last_freed_time=now + pos * 1e-9
+                ):
                     continue
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
