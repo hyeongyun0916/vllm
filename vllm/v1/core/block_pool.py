@@ -270,6 +270,10 @@ class BlockPool:
                 map.
         """
         if num_cached_blocks >= num_full_blocks:
+            # Full prefix hit (no new blocks to cache). Still apply directives so
+            # a covering reuse refreshes the retention meta's expiry; otherwise a
+            # purely-reused prefix never reaches the hook and its protection lapses.
+            self._apply_retention_hook(request, blocks, num_full_blocks, block_size)
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
