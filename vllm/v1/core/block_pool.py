@@ -702,6 +702,34 @@ class BlockPool:
             block_size,
         )
 
+    def refresh_retention_on_reuse(
+        self,
+        request: Request,
+        hit_blocks: Sequence[list[KVCacheBlock]],
+        block_sizes: Sequence[int],
+    ) -> None:
+        """Refresh retention protection for the blocks that served a cache hit.
+
+        Applying directives only while caching leaves a reused block
+        unprotected in two ways. Expiry releases protection without evicting,
+        so a lapsed block keeps serving hits with no sidecar entry until some
+        request happens to re-cache it. And when the same content sits in
+        several cached blocks, the caching path refreshes the block it
+        allocated, not the one that served the hit. Reuse is the strongest
+        evidence a block is still needed, so refresh here, where the blocks
+        that actually served the hit are known.
+
+        Args:
+            request: The reusing request, whose directives are applied.
+            hit_blocks: Per-group hit blocks, each a prefix starting at token 0.
+            block_sizes: Block size of each KV cache group, in the same order.
+        """
+        for group_blocks, block_size in zip(hit_blocks, block_sizes):
+            if group_blocks:
+                self._apply_retention_hook(
+                    request, group_blocks, len(group_blocks), block_size
+                )
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 

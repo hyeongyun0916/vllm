@@ -1,11 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+import pytest
+
+from tests.v1.core.test_prefix_caching import (
+    make_kv_cache_config,
+    make_kv_cache_manager,
+    make_request,
+)
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, init_none_hash
 from vllm.v1.core.priority_eviction_queue import (
     PriorityEvictionQueue,
     RetentionMeta,
 )
+
+
+@pytest.fixture(autouse=True)
+def _auto_init_hash_fn():
+    init_none_hash(sha256)
 
 
 def _make_block(block_id: int) -> KVCacheBlock:
@@ -1023,3 +1036,96 @@ class TestStructuralInvariants:
             f"Request.__init__ assigns to {leaks!r}. Read retention from "
             "request.sampling_params.extra_args at the use site instead."
         )
+
+
+def _with_directives(request, end: int, priority: int, scope: str):
+    request.sampling_params.extra_args = {
+        "retention_directives": [
+            {"start": 0, "end": end, "priority": priority, "duration": 600.0}
+        ],
+        "retention_scope": scope,
+    }
+    return request
+
+
+class TestRetentionRefreshOnReuse:
+    """Reuse renews protection, at the moment the hit is served.
+
+    Expiry releases protection without evicting, so a block whose TTL lapsed
+    keeps serving cache hits with no sidecar entry. Re-applying directives only
+    while caching leaves that block unprotected across the step that reuses it,
+    and, when the same content is cached in more than one block, refreshes the
+    block the caching path allocated rather than the one that served the hit.
+    """
+
+    def test_hit_restores_protection_of_lapsed_block(self):
+        block_size = 16
+        manager = make_kv_cache_manager(
+            make_kv_cache_config(block_size, 11),
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=block_size,
+        )
+        pq = manager.block_pool.priority_eviction_queue
+        common = [i for i in range(3) for _ in range(block_size)]  # 3 full blocks
+
+        producer = _with_directives(
+            make_request("producer", common + [3] * 7, block_size, sha256),
+            end=55,
+            priority=90,
+            scope="s1",
+        )
+        computed, num_computed, _ = manager.get_computed_blocks(producer)
+        manager.allocate_slots(producer, 55, num_computed, computed)
+        assert pq._meta, "the producer's directives must protect its own blocks"
+
+        # Protection lapses: expiry drops the sidecar entry and routes the block
+        # to the LRU list, leaving it cached and still able to serve hits.
+        for block_id in list(pq._meta):
+            pq._meta.pop(block_id)
+        pq._in_queue.clear()
+
+        reuser = _with_directives(
+            make_request("reuser", common + [3] * 5, block_size, sha256),
+            end=53,
+            priority=75,
+            scope="s2",
+        )
+        computed, num_computed, _ = manager.get_computed_blocks(reuser)
+        assert num_computed == 3 * block_size, "the common prefix must still hit"
+        for block in computed.blocks[0]:
+            meta = pq._meta.get(block.block_id)
+            assert meta is not None, (
+                "a block that served the hit must carry protection by the time "
+                "get_computed_blocks returns, not only once the reuser caches"
+            )
+            assert meta.priority == 75
+
+    def test_each_group_maps_offsets_with_its_own_block_size(self):
+        """Per-group block sizes decide which blocks a directive range covers.
+        Reusing one group's size for every group shifts a later group's token
+        offsets and protects the wrong blocks."""
+        from vllm.v1.core.block_pool import BlockPool
+
+        pool = BlockPool(
+            num_gpu_blocks=8,
+            enable_caching=True,
+            hash_block_size=16,
+            enable_kv_cache_events=False,
+        )
+        request = _with_directives(
+            make_request("r", [0] * 16, 16, sha256), end=64, priority=60, scope="s"
+        )
+        request.sampling_params.extra_args["retention_directives"] = [
+            {"start": 32, "end": 64, "priority": 60, "duration": 600.0}
+        ]
+        group0 = [pool.blocks[1], pool.blocks[2]]  # size 16 -> 0..15, 16..31
+        group1 = [pool.blocks[3], pool.blocks[4]]  # size 32 -> 0..31, 32..63
+
+        pool.refresh_retention_on_reuse(request, [group0, group1], [16, 32])
+
+        meta = pool.priority_eviction_queue._meta
+        assert meta.get(pool.blocks[1].block_id) is None
+        assert meta.get(pool.blocks[2].block_id) is None
+        assert meta.get(pool.blocks[3].block_id) is None
+        assert meta.get(pool.blocks[4].block_id) is not None

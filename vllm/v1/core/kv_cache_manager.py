@@ -173,6 +173,9 @@ class KVCacheManager:
             )
             for group in kv_cache_config.kv_cache_groups
         )
+        self.group_block_sizes = tuple(
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
+        )
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -255,6 +258,16 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        # Reuse renews protection: the blocks that just served this hit are the
+        # ones proven to still be needed. Deferring to cache_full_blocks would
+        # leave a block whose TTL lapsed serving hits unprotected (expiry
+        # releases protection without evicting) and, for content cached in
+        # several blocks, would refresh a replica other than the serving one.
+        if num_new_computed_tokens > 0:
+            self.block_pool.refresh_retention_on_reuse(
+                request, computed_blocks, self.group_block_sizes
+            )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
