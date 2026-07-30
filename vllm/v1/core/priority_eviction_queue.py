@@ -135,8 +135,12 @@ class PriorityEvictionQueue:
           and takes ownership of the block.
         - Downgrade or refresh (new <= current priority): only the current
           owner may do this.
-        - No matching directive: if the caller has scope ownership of this
-          block, the sidecar entry is cleared.
+        - No matching directive: the block is left alone. Saying nothing about
+          a block is not a request to unprotect it -- a caller that no longer
+          needs a block releases it by naming it at a low priority with a short
+          duration, and a block nobody renews expires on its own. Treating
+          silence as a release let one turn drop the protection another turn
+          had just placed on a block it was actively reusing.
         """
         now = time.monotonic()
         for idx, block in enumerate(blocks):
@@ -161,9 +165,7 @@ class PriorityEvictionQueue:
             current = self._meta.get(block.block_id)
 
             if best_priority < 0:
-                # No matching directive. Owner-initiated clear only.
-                if scope is not None and current is not None and current.scope == scope:
-                    self._meta.pop(block.block_id, None)
+                # No matching directive: leave the block's protection as it is.
                 continue
 
             expiry = now + best_duration if best_duration is not None else None

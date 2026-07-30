@@ -374,19 +374,43 @@ class TestApplyDirectives:
         assert meta.priority == 20
         assert meta.scope == "alice"
 
-    def test_owner_clear_on_no_match(self):
+    def test_owner_saying_nothing_does_not_clear(self):
+        """Silence is not a release. An owner whose directives skip a block it
+        still holds must not drop that block's protection: its own next turn --
+        or another turn reusing the same content -- may be relying on it. A
+        caller that really is done names the block at a low priority with a
+        short duration instead."""
         queue = PriorityEvictionQueue()
         block = _make_block(0)
         _set_meta(queue, block, priority=50, scope="alice")
-        # alice issues directives that don't cover this block — sidecar
-        # entry is cleared.
         queue.apply_directives(
             [block],
             [{"start": 100, "end": 200, "priority": 90}],
             scope="alice",
             block_size=16,
         )
-        assert self._peek_meta(queue, 0) is None
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None, "an uncovered block must keep its protection"
+        assert meta.priority == 50
+        assert meta.scope == "alice"
+
+    def test_owner_releases_by_naming_a_low_priority(self):
+        """The explicit way to let a block go: cover it at FLOOR with a short
+        duration. Protection stays tracked (so nobody's reuse is broken) but
+        the block is evicted first and expires on its own."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 1, "duration": 5.0}],
+            scope="alice",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None
+        assert meta.priority == 1
+        assert meta.expiry is not None
 
     def test_non_owner_no_clear_on_no_match(self):
         queue = PriorityEvictionQueue()
