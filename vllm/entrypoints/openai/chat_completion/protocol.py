@@ -464,6 +464,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "Retention directives for priority-based KV-cache eviction. "
             "Each directive: {start: int, end: int|null, "
             "priority: int (0-100), duration: float|null}. "
+            "Priority 1-100 protects the range; priority 0 releases it. "
+            "Ranges no directive covers are left as they are, so protection is "
+            "dropped only by an explicit release or by expiry. "
             "Alternatively {covers_output: true, priority, duration} pins the "
             "generated tail (resolved server-side to the output token range)."
         ),

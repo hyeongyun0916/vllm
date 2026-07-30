@@ -330,6 +330,58 @@ class TestApplyDirectives:
         meta = self._peek_meta(queue, 0)
         assert meta.expiry == 1060.0
 
+    def test_escalation_keeps_the_longer_hold(self, monkeypatch):
+        """Raising priority must not cut the hold short: a block held until
+        t+600 that someone escalates with a 60s duration stays until t+600,
+        otherwise a higher-priority claim would make the block expire sooner
+        than the lower-priority one it replaced."""
+        import time as time_mod
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 1000.0)
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=30, scope="alice", expiry=1600.0)
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 80, "duration": 60.0}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta.priority == 80
+        assert meta.expiry == 1600.0
+
+    def test_escalation_extends_a_shorter_hold(self, monkeypatch):
+        import time as time_mod
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 1000.0)
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=30, scope="alice", expiry=1100.0)
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 80, "duration": 600.0}],
+            scope="bob",
+            block_size=16,
+        )
+        assert self._peek_meta(queue, 0).expiry == 1600.0
+
+    def test_escalation_keeps_an_unlimited_hold(self):
+        """An entry with no expiry never expires, so escalating it with a
+        duration must not give it one."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=30, scope="alice", expiry=None)
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 80, "duration": 60.0}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta.priority == 80
+        assert meta.expiry is None
+
     def test_escalation_from_different_scope(self):
         queue = PriorityEvictionQueue()
         block = _make_block(0)
@@ -394,23 +446,87 @@ class TestApplyDirectives:
         assert meta.priority == 50
         assert meta.scope == "alice"
 
-    def test_owner_releases_by_naming_a_low_priority(self):
-        """The explicit way to let a block go: cover it at FLOOR with a short
-        duration. Protection stays tracked (so nobody's reuse is broken) but
-        the block is evicted first and expires on its own."""
+    def test_owner_releases_with_priority_zero(self):
+        """Priority 0 is the explicit release: the owner names the range and the
+        entry is dropped. This is the only directive-driven way to unprotect a
+        block, so a caller can hand a block back without an omission doing it by
+        accident."""
         queue = PriorityEvictionQueue()
         block = _make_block(0)
         _set_meta(queue, block, priority=50, scope="alice")
         queue.apply_directives(
             [block],
-            [{"start": 0, "end": 16, "priority": 1, "duration": 5.0}],
+            [{"start": 0, "end": 16, "priority": 0}],
+            scope="alice",
+            block_size=16,
+        )
+        assert self._peek_meta(queue, 0) is None
+        assert block not in queue
+
+    def test_priority_zero_from_non_owner_is_ignored(self):
+        """A release is a downgrade, so the same restriction applies: bob must
+        not be able to drop protection alice is relying on."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 0}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None
+        assert meta.priority == 50
+        assert meta.scope == "alice"
+
+    def test_priority_zero_on_unprotected_block_is_noop(self):
+        """Releasing something already unprotected must not create an entry."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 0}],
+            scope="alice",
+            block_size=16,
+        )
+        assert self._peek_meta(queue, 0) is None
+
+    def test_protection_wins_over_release_on_the_same_block(self):
+        """When two directives cover one block, the highest priority decides, so
+        a release cannot cancel a protection claim in the same request."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        queue.apply_directives(
+            [block],
+            [
+                {"start": 0, "end": 16, "priority": 0},
+                {"start": 0, "end": 16, "priority": 90, "duration": 30.0},
+            ],
             scope="alice",
             block_size=16,
         )
         meta = self._peek_meta(queue, 0)
         assert meta is not None
-        assert meta.priority == 1
-        assert meta.expiry is not None
+        assert meta.priority == 90
+
+    def test_directive_without_priority_is_ignored(self):
+        """Priority is what says protect-or-release, so a directive that omits
+        it carries no instruction — reading a missing field as 0 would turn a
+        malformed directive into a release."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "duration": 30.0}],
+            scope="alice",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None
+        assert meta.priority == 50
 
     def test_non_owner_no_clear_on_no_match(self):
         queue = PriorityEvictionQueue()

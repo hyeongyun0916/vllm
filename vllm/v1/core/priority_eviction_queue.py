@@ -18,6 +18,13 @@ class RetentionMeta:
     last_freed_time: float
 
 
+def _later_expiry(a: float | None, b: float | None) -> float | None:
+    """The later of two expiries, where None means "never expires" and wins."""
+    if a is None or b is None:
+        return None
+    return max(a, b)
+
+
 class PriorityEvictionQueue:
     def __init__(self) -> None:
         self._meta: dict[int, RetentionMeta] = {}
@@ -131,15 +138,20 @@ class PriorityEvictionQueue:
         """For each full block, find the highest-priority overlapping
         directive and update the sidecar entry under these rules:
 
+        - Priority 1-100 protects; priority 0 releases.
         - Escalation (new > current priority): any caller may raise priority
-          and takes ownership of the block.
+          and takes ownership of the block. The expiry only moves later, so
+          raising a block's priority never shortens a hold already in place.
+          Only its owner shortens a block's hold, by naming it again.
         - Downgrade or refresh (new <= current priority): only the current
           owner may do this.
+        - Release (priority 0): only the current owner may drop the entry, the
+          same restriction as a downgrade. A caller that no longer needs a
+          block says so; a block nobody renews also expires on its own.
         - No matching directive: the block is left alone. Saying nothing about
-          a block is not a request to unprotect it -- a caller that no longer
-          needs a block releases it by naming it at a low priority with a short
-          duration, and a block nobody renews expires on its own. Treating
-          silence as a release let one turn drop the protection another turn
+          a block is not a request to unprotect it, and directives without an
+          explicit priority are ignored rather than read as a release -- when
+          silence meant release, one turn dropped the protection another turn
           had just placed on a block it was actively reusing.
         """
         now = time.monotonic()
@@ -157,7 +169,9 @@ class PriorityEvictionQueue:
                     continue
                 if d_start >= token_end:
                     continue
-                p = d.get("priority", 0)
+                p = d.get("priority")
+                if p is None:
+                    continue
                 if p > best_priority:
                     best_priority = p
                     best_duration = d.get("duration")
@@ -168,13 +182,27 @@ class PriorityEvictionQueue:
                 # No matching directive: leave the block's protection as it is.
                 continue
 
+            if best_priority == 0:
+                # Explicit release. Restricted to the owner, like a downgrade:
+                # otherwise one scope could drop protection another scope is
+                # relying on. Nothing to do when the block is unprotected.
+                if scope is not None and current is not None and current.scope == scope:
+                    self.unprotect(block.block_id)
+                continue
+
             expiry = now + best_duration if best_duration is not None else None
             current_priority = current.priority if current is not None else -1
             if best_priority > current_priority:
                 # Escalation: any caller may raise priority and takes ownership.
+                # The hold only grows — raising a block's priority must not cut
+                # short a longer one someone else is already relying on.
                 self._meta[block.block_id] = RetentionMeta(
                     priority=best_priority,
-                    expiry=expiry,
+                    expiry=(
+                        expiry
+                        if current is None
+                        else _later_expiry(expiry, current.expiry)
+                    ),
                     scope=scope,
                     last_freed_time=current.last_freed_time if current else 0.0,
                 )
@@ -185,11 +213,7 @@ class PriorityEvictionQueue:
                 # the hold, never downgrade or steal ownership.
                 self._meta[block.block_id] = RetentionMeta(
                     priority=current.priority,
-                    expiry=(
-                        None
-                        if (expiry is None or current.expiry is None)
-                        else max(expiry, current.expiry)
-                    ),
+                    expiry=_later_expiry(expiry, current.expiry),
                     scope=current.scope,
                     last_freed_time=current.last_freed_time,
                 )
