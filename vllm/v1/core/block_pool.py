@@ -837,7 +837,16 @@ class BlockPool:
             # whichever queue holds it (priority queue or LRU free list).
             if block.ref_cnt == 0 and not block.is_null:
                 if block in self.priority_eviction_queue:
-                    self.priority_eviction_queue.suspend(block)
+                    # A hold lasts until the block is read again, and this is
+                    # that read, so it is spent. Suspending it instead would
+                    # keep the entry for the rest of its window and go on
+                    # protecting a block whose reader has moved on -- and would
+                    # leave a hold standing in for a claim in what the sidecar
+                    # reports. A real claim survives, as always.
+                    if self.priority_eviction_queue.is_hold(block.block_id):
+                        self.priority_eviction_queue.unprotect(block.block_id)
+                    else:
+                        self.priority_eviction_queue.suspend(block)
                 elif (
                     block.prev_free_block is not None
                     or block.next_free_block is not None

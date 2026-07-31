@@ -1233,6 +1233,53 @@ class TestPreemptionHold:
         assert meta.priority == 10
         assert meta.scope == "alice"
 
+    def test_reading_a_held_block_spends_the_hold(self):
+        """One read is all a hold is for. Left in place it would keep protecting
+        the block after its reader moved on, and would stand in for a claim in
+        what the sidecar reports."""
+        from vllm.v1.core.block_pool import BlockPool
+
+        pool = BlockPool(
+            num_gpu_blocks=8,
+            enable_caching=True,
+            hash_block_size=16,
+            enable_kv_cache_events=False,
+        )
+        pq = pool.priority_eviction_queue
+        block = pool.blocks[1]
+        pool.free_block_queue.remove(block)
+        pq.hold_blocks([block], priority=100, duration=20.0, limit=100)
+        pq.try_insert(block)
+        assert block in pq
+
+        pool.touch([block])
+
+        assert block.block_id not in pq._meta, "the hold must be gone"
+        assert block not in pq
+
+    def test_reading_a_claimed_block_keeps_the_claim(self):
+        """The same path must not drop a client's claim: the block is coming back
+        to the queue when it is freed again."""
+        from vllm.v1.core.block_pool import BlockPool
+
+        pool = BlockPool(
+            num_gpu_blocks=8,
+            enable_caching=True,
+            hash_block_size=16,
+            enable_kv_cache_events=False,
+        )
+        pq = pool.priority_eviction_queue
+        block = pool.blocks[1]
+        pool.free_block_queue.remove(block)
+        _set_meta(pq, block, priority=90, expiry=None, scope="alice")
+        pq.try_insert(block)
+
+        pool.touch([block])
+
+        meta = pq._meta.get(block.block_id)
+        assert meta is not None and meta.priority == 90 and meta.scope == "alice"
+        assert block not in pq  # suspended while referenced
+
     def test_hold_expires_when_the_request_never_returns(self):
         """Timeouts and aborts happen, so the hold cannot outlive its window."""
         import time as time_mod

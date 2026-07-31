@@ -128,6 +128,11 @@ class PriorityEvictionQueue:
         self._meta.pop(block_id, None)
         self._in_queue.discard(block_id)
 
+    def is_hold(self, block_id: int) -> bool:
+        """Whether the block's entry is a scheduler hold rather than a claim."""
+        meta = self._meta.get(block_id)
+        return meta is not None and meta.hold
+
     def hold_blocks(
         self,
         blocks: Iterable[KVCacheBlock],
