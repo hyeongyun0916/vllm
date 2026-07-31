@@ -297,6 +297,9 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_RETENTION_BUDGET_FRAC: float = 0.6
+    VLLM_RETENTION_PREEMPT_HOLD_PRIORITY: int = 100
+    VLLM_RETENTION_PREEMPT_HOLD_S: float = 20.0
+    VLLM_RETENTION_PREEMPT_HOLD_FRAC: float = 0.25
 
 
 def get_default_cache_root():
@@ -1124,6 +1127,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # retention; 1.0 allows using all blocks.
     "VLLM_RETENTION_BUDGET_FRAC": lambda: float(
         os.getenv("VLLM_RETENTION_BUDGET_FRAC", "0.6")
+    ),
+    # A preempted request re-reads the blocks it already filled when it is
+    # scheduled again, but those blocks carry no claim of their own, so they sit
+    # in the LRU list ahead of anything freed later and are spent first. These
+    # hold them briefly instead, at a priority high enough to outlast blocks
+    # nothing is waiting on. Set the priority to 0 to disable the hold.
+    "VLLM_RETENTION_PREEMPT_HOLD_PRIORITY": lambda: int(
+        os.getenv("VLLM_RETENTION_PREEMPT_HOLD_PRIORITY", "100")
+    ),
+    "VLLM_RETENTION_PREEMPT_HOLD_S": lambda: float(
+        os.getenv("VLLM_RETENTION_PREEMPT_HOLD_S", "20.0")
+    ),
+    "VLLM_RETENTION_PREEMPT_HOLD_FRAC": lambda: float(
+        os.getenv("VLLM_RETENTION_PREEMPT_HOLD_FRAC", "0.25")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

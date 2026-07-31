@@ -702,6 +702,26 @@ class BlockPool:
             block_size,
         )
 
+    def hold_preempted_blocks(self, blocks: Iterable[KVCacheBlock]) -> int:
+        """Hold a preempted request's blocks so its resume can read them back.
+
+        Freeing the request's blocks is how preemption makes room, and the ones
+        it never claimed land in the LRU list -- where blocks freed afterwards
+        queue up behind them and are reclaimed later, so the blocks a resume
+        needs are spent before genuinely dead ones. Holding them reverses that
+        order. Set the hold priority to 0 to turn this off.
+        """
+        priority = envs.VLLM_RETENTION_PREEMPT_HOLD_PRIORITY
+        if priority <= 0:
+            return 0
+        limit = int(len(self.blocks) * envs.VLLM_RETENTION_PREEMPT_HOLD_FRAC)
+        return self.priority_eviction_queue.hold_blocks(
+            blocks,
+            priority=priority,
+            duration=envs.VLLM_RETENTION_PREEMPT_HOLD_S,
+            limit=limit,
+        )
+
     def refresh_retention_on_reuse(
         self,
         request: Request,

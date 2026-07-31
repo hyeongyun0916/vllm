@@ -300,6 +300,16 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    def hold_preempted_blocks(self, request: Request) -> int:
+        """Hold the blocks of a request being preempted, so the resume that
+        follows can read them back instead of re-prefilling them. Must run
+        before the blocks are freed: the free path routes a block by whether it
+        carries an entry."""
+        held = 0
+        for group_blocks in self.coordinator.get_blocks(request.request_id):
+            held += self.block_pool.hold_preempted_blocks(group_blocks)
+        return held
+
     def allocate_slots(
         self,
         request: Request,

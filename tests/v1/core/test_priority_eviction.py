@@ -1178,6 +1178,76 @@ class TestStructuralInvariants:
         )
 
 
+class TestPreemptionHold:
+    """The scheduler holds a preempted request's blocks so its resume reads them
+    back. A hold is not a retention claim: it stands in only until a real one
+    arrives, and it expires on its own if the request never comes back."""
+
+    def test_hold_covers_blocks_without_a_claim(self):
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(3)]
+        held = queue.hold_blocks(blocks, priority=90, duration=20.0, limit=100)
+        assert held == 3
+        for block in blocks:
+            meta = queue._meta[block.block_id]
+            assert meta.hold is True
+            assert meta.priority == 90
+            assert meta.expiry is not None
+
+    def test_hold_leaves_an_existing_claim_alone(self):
+        """A client's claim carries the priority and expiry its owner asked for;
+        a hold must not overwrite either."""
+        queue = PriorityEvictionQueue()
+        claimed, unclaimed = _make_block(0), _make_block(1)
+        _set_meta(queue, claimed, priority=50, expiry=9999.0, scope="alice")
+        held = queue.hold_blocks(
+            [claimed, unclaimed], priority=90, duration=20.0, limit=100
+        )
+        assert held == 1
+        assert queue._meta[claimed.block_id].priority == 50
+        assert queue._meta[claimed.block_id].scope == "alice"
+        assert queue._meta[claimed.block_id].hold is False
+
+    def test_hold_stops_at_the_limit(self):
+        """A few large preemptions must not be able to pin the cache."""
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(10)]
+        assert queue.hold_blocks(blocks, priority=90, duration=20.0, limit=4) == 4
+        assert len(queue._meta) == 4
+
+    def test_a_claim_replaces_a_hold_at_any_priority(self):
+        """A hold yields to a real claim even when the claim asks for less. Read
+        as a downgrade instead, a low-priority claim would be ignored and the
+        block would keep the hold's short expiry rather than the owner's."""
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        queue.hold_blocks([block], priority=90, duration=20.0, limit=100)
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 10, "duration": 600.0}],
+            scope="alice",
+            block_size=16,
+        )
+        meta = queue._meta[block.block_id]
+        assert meta.hold is False
+        assert meta.priority == 10
+        assert meta.scope == "alice"
+
+    def test_hold_expires_when_the_request_never_returns(self):
+        """Timeouts and aborts happen, so the hold cannot outlive its window."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        queue.hold_blocks([block], priority=90, duration=20.0, limit=100)
+        queue.try_insert(block)
+        assert block in queue
+        # Put the expiry in the past, which is what release_expired compares.
+        queue._meta[block.block_id].expiry = time_mod.monotonic() - 1.0
+        assert queue.release_expired() == [block.block_id]
+        assert block.block_id not in queue._meta
+
+
 def _with_directives(request, end: int, priority: int, scope: str):
     request.sampling_params.extra_args = {
         "retention_directives": [

@@ -1218,6 +1218,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        # This request will read its own blocks back when it is scheduled again,
+        # so mark them before freeing: the free path decides between the priority
+        # queue and the LRU list by whether a block carries an entry.
+        self.kv_cache_manager.hold_preempted_blocks(request)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)

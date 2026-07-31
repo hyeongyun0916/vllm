@@ -5,6 +5,7 @@ retention metadata."""
 
 import heapq
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -16,6 +17,12 @@ class RetentionMeta:
     expiry: float | None
     scope: str | None
     last_freed_time: float
+    # A hold is not a client's retention claim: the scheduler installs it on the
+    # blocks of a request it preempts, because that request re-reads them when it
+    # resumes. It stands in only until something real arrives, so any covering
+    # directive replaces it regardless of priority (see apply_directives), and it
+    # is short-lived by construction.
+    hold: bool = False
 
 
 def _later_expiry(a: float | None, b: float | None) -> float | None:
@@ -121,6 +128,50 @@ class PriorityEvictionQueue:
         self._meta.pop(block_id, None)
         self._in_queue.discard(block_id)
 
+    def hold_blocks(
+        self,
+        blocks: Iterable[KVCacheBlock],
+        priority: int,
+        duration: float,
+        limit: int,
+    ) -> int:
+        """Hold blocks a preempted request will re-read, and return how many.
+
+        A preempted request restarts its prefill and reads back the blocks it
+        already filled, so those blocks are about to be needed again -- but they
+        carry no claim of their own, which puts them in the LRU list where
+        anything freed later is reclaimed after them. A hold moves them into the
+        queue so genuinely dead blocks are spent first.
+
+        Only blocks with no entry are held, so a client's claim is never
+        overwritten, and only up to ``limit`` total blocks are ever held, so a
+        few large preemptions cannot pin the cache.
+
+        Args:
+            blocks: The request's blocks, prefix first — a resumed request can
+                only use a contiguous prefix, so that is what is held.
+            priority: Priority for the hold.
+            duration: Seconds to hold for. Short: it only has to outlast the
+                wait for this request to be scheduled again.
+            limit: Ceiling on the total number of blocks held at once.
+        """
+        expiry = time.monotonic() + duration
+        held = 0
+        for block in blocks:
+            if len(self._meta) >= limit:
+                break
+            if block.is_null or block.block_id in self._meta:
+                continue
+            self._meta[block.block_id] = RetentionMeta(
+                priority=priority,
+                expiry=expiry,
+                scope=None,
+                last_freed_time=0.0,
+                hold=True,
+            )
+            held += 1
+        return held
+
     def clear(self) -> None:
         """Drop all sidecar entries and heap state."""
         self._meta.clear()
@@ -177,6 +228,12 @@ class PriorityEvictionQueue:
                     best_duration = d.get("duration")
 
             current = self._meta.get(block.block_id)
+            if current is not None and current.hold:
+                # A scheduler hold yields to any real claim: treat it as absent so
+                # the covering directive lands instead of being read as a
+                # downgrade and dropped, which would leave the block on the
+                # hold's short expiry rather than the one its owner asked for.
+                current = None
 
             if best_priority < 0:
                 # No matching directive: leave the block's protection as it is.
