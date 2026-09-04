@@ -1386,3 +1386,91 @@ class TestRetentionRefreshOnReuse:
         assert meta.get(pool.blocks[2].block_id) is None
         assert meta.get(pool.blocks[3].block_id) is None
         assert meta.get(pool.blocks[4].block_id) is not None
+
+
+def test_apply_directives_reports_blocks_it_released():
+    """apply_directives must name the blocks whose protection it dropped.
+
+    unprotect() discards the block from the priority queue, but it cannot put it
+    back on the LRU list -- that list belongs to the pool. So the pool has to be
+    told which blocks were released, the same way release_expired() reports
+    lapsed ones.
+    """
+    pq = PriorityEvictionQueue()
+    block = KVCacheBlock(block_id=1)
+    claim = [{"start": 0, "end": 16, "priority": 50, "duration": 600.0}]
+    release = [{"start": 0, "end": 16, "priority": 0}]
+
+    assert pq.apply_directives([block], claim, "sess", 16) == []
+    assert pq.apply_directives([block], release, "sess", 16) == [1]
+    # already unprotected -> nothing to report
+    assert pq.apply_directives([block], release, "sess", 16) == []
+
+
+def test_a_non_owner_release_reports_nothing():
+    pq = PriorityEvictionQueue()
+    block = KVCacheBlock(block_id=2)
+    pq.apply_directives(
+        [block],
+        [{"start": 0, "end": 16, "priority": 50, "duration": 600.0}],
+        "owner",
+        16,
+    )
+    assert (
+        pq.apply_directives(
+            [block], [{"start": 0, "end": 16, "priority": 0}], "someone-else", 16
+        )
+        == []
+    )
+    # still protected: the owner's own release now has something to drop
+    assert pq.apply_directives(
+        [block], [{"start": 0, "end": 16, "priority": 0}], "owner", 16
+    ) == [2]
+
+
+def test_pool_returns_a_released_free_block_to_the_lru_list():
+    """The pool must re-list a block released while it was free.
+
+    Protect-on-hit applies directives before touch() runs, so a hit block is
+    free and still in the priority queue at that moment. A priority-0 release
+    there used to drop it from both lists, shrinking the pool for the rest of
+    the run.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+    pq = pool.priority_eviction_queue
+    block = pool.blocks[1]
+    claim = [{"start": 0, "end": 16, "priority": 50, "duration": 600.0}]
+
+    pq.apply_directives([block], claim, "sess", 16)
+    pool.free_block_queue.remove(block)  # free + protected, as after a free
+    assert pq.try_insert(block) is True
+    reachable_before = pool.get_num_free_blocks()
+
+    pool._apply_retention_hook(
+        _RequestWithDirectives([{"start": 0, "end": 16, "priority": 0}], "sess"),
+        [block],
+        1,
+        16,
+    )
+
+    assert block not in pq
+    assert pool.get_num_free_blocks() == reachable_before, "block left both lists"
+
+
+class _RequestWithDirectives:
+    """Minimal stand-in for the parts of Request the retention hook reads."""
+
+    def __init__(self, directives, scope):
+        self.sampling_params = type(
+            "SP",
+            (),
+            {
+                "extra_args": {
+                    "retention_directives": directives,
+                    "retention_scope": scope,
+                }
+            },
+        )()
+        self.num_prompt_tokens = 16

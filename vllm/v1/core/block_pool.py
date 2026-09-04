@@ -695,12 +695,26 @@ class BlockPool:
                     else d
                     for d in directives
                 ]
-        self.priority_eviction_queue.apply_directives(
+        released = self.priority_eviction_queue.apply_directives(
             blocks[:num_full_blocks],
             directives or [],
             scope,
             block_size,
         )
+        # A released block that is already free left the priority queue without
+        # joining the LRU list, so nothing could ever allocate it again. Reuse
+        # applies directives before touch() runs, which is exactly when a hit
+        # block is free and still queued, so route those back the way
+        # release_expired()'s blocks are routed. A referenced block needs no
+        # routing: losing its sidecar sends it to the LRU list when it is freed.
+        if released:
+            freed = [
+                self.blocks[block_id]
+                for block_id in released
+                if self.blocks[block_id].ref_cnt == 0
+            ]
+            if freed:
+                self.free_block_queue.append_n(freed)
 
     def hold_preempted_blocks(self, blocks: Iterable[KVCacheBlock]) -> int:
         """Hold a preempted request's blocks so its resume can read them back.

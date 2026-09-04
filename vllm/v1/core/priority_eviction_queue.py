@@ -190,7 +190,7 @@ class PriorityEvictionQueue:
         directives: list[dict],
         scope: str | None,
         block_size: int,
-    ) -> None:
+    ) -> list[int]:
         """For each full block, find the highest-priority overlapping
         directive and update the sidecar entry under these rules:
 
@@ -204,6 +204,11 @@ class PriorityEvictionQueue:
         - Release (priority 0): only the current owner may drop the entry, the
           same restriction as a downgrade. A caller that no longer needs a
           block says so; a block nobody renews also expires on its own.
+        Returns the block_ids whose protection was dropped. unprotect() takes a
+        block out of this queue but cannot put it back on the LRU list -- that
+        list belongs to the pool -- so the caller has to route them, the same way
+        release_expired()'s return value is routed.
+
         - No matching directive: the block is left alone. Saying nothing about
           a block is not a request to unprotect it, and directives without an
           explicit priority are ignored rather than read as a release -- when
@@ -211,6 +216,7 @@ class PriorityEvictionQueue:
           had just placed on a block it was actively reusing.
         """
         now = time.monotonic()
+        released: list[int] = []
         for idx, block in enumerate(blocks):
             if block.is_null:
                 continue
@@ -250,6 +256,7 @@ class PriorityEvictionQueue:
                 # relying on. Nothing to do when the block is unprotected.
                 if scope is not None and current is not None and current.scope == scope:
                     self.unprotect(block.block_id)
+                    released.append(block.block_id)
                 continue
 
             expiry = now + best_duration if best_duration is not None else None
@@ -288,3 +295,5 @@ class PriorityEvictionQueue:
                     last_freed_time=current.last_freed_time,
                 )
             # Non-owner downgrade: silently ignored.
+
+        return released
