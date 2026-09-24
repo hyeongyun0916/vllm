@@ -918,7 +918,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((42).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
@@ -977,7 +977,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((77).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
         pool.free_blocks([block])
         # Block is now in LRU with cache map entry intact.
@@ -1020,7 +1020,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_old = BlockHash((123).to_bytes(32, "little"))
         h_old = make_block_hash_with_group_id(raw_old, 0)
-        block.block_hash = h_old
+        block.set_block_hash(h_old)
         pool.cached_block_hash_to_block.insert(h_old, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
@@ -1104,7 +1104,7 @@ class TestBlockPoolPriorityEviction:
         block.ref_cnt = 1
         raw_hash = BlockHash((321).to_bytes(32, "little"))
         h = make_block_hash_with_group_id(raw_hash, 0)
-        block.block_hash = h
+        block.set_block_hash(h)
         pool.cached_block_hash_to_block.insert(h, block)
 
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
