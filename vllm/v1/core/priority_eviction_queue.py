@@ -43,6 +43,9 @@ class PriorityEvictionQueue:
         # evict by the old (priority, last_freed_time) and invert the order.
         self._gen: dict[int, int] = {}
 
+    # Rebuild the heap once stale tuples outnumber live entries by this much.
+    _COMPACT_SLACK = 4096
+
     @property
     def num_blocks(self) -> int:
         return len(self._in_queue)
@@ -76,7 +79,25 @@ class PriorityEvictionQueue:
             (meta.priority, meta.last_freed_time, gen, block.block_id, block),
         )
         self._in_queue.add(block.block_id)
+        # Every free of a protected block pushes a tuple and only pop_lowest
+        # discards the stale ones. While the LRU list absorbs allocations no pop
+        # runs, so a long run with expiring protections piles up millions of
+        # stale tuples and the first pop that follows has to skip them all --
+        # measured as +11% inter-token latency over a two-hour replay. Rebuild
+        # from the live entries once stale ones dominate; amortized O(1).
+        if len(self._heap) > 2 * len(self._in_queue) + self._COMPACT_SLACK:
+            self._compact()
         return True
+
+    def _compact(self) -> None:
+        """Drop stale heap tuples (block left the queue, or a newer insert
+        superseded it) and re-heapify the live ones."""
+        gen = self._gen
+        in_queue = self._in_queue
+        self._heap = [
+            t for t in self._heap if t[3] in in_queue and t[2] == gen.get(t[3])
+        ]
+        heapq.heapify(self._heap)
 
     def suspend(self, block: KVCacheBlock) -> None:
         """Drop the block from the eviction-candidate set (_in_queue) only;

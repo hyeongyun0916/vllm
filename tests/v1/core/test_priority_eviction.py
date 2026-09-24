@@ -1474,3 +1474,28 @@ class _RequestWithDirectives:
             },
         )()
         self.num_prompt_tokens = 16
+
+
+def test_heap_stays_bounded_under_free_touch_churn():
+    """A block that is hit and freed over and over pushes a heap tuple per free;
+    only pop_lowest ever discards the stale ones. With allocations served from
+    the LRU list for long stretches (expiring protections), nothing pops, and a
+    two-hour replay piled up millions of stale tuples that the next pop had to
+    skip through. The queue must compact on its own, and popping afterwards
+    must still return the lowest live entry."""
+    queue = PriorityEvictionQueue()
+    blocks = [_make_block(i) for i in range(64)]
+    for b in blocks:
+        _set_meta(queue, b, priority=50, scope="s")
+    for round_ in range(2000):  # 128k inserts, 64 live
+        for b in blocks:
+            queue.suspend(b)  # touch(): referenced again
+            assert queue.try_insert(b, last_freed_time=float(round_))
+    assert len(queue._heap) <= 2 * queue.num_blocks + queue._COMPACT_SLACK
+    low = _make_block(999)
+    _set_meta(queue, low, priority=1, scope="s")
+    assert queue.try_insert(low, last_freed_time=0.0)
+    assert queue.pop_lowest() is low
+    popped = queue.pop_lowest()
+    assert popped is not None and popped.block_id < 64
+    assert queue.num_blocks == 63
