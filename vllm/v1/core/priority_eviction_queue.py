@@ -42,6 +42,11 @@ class PriorityEvictionQueue:
         # against a suspend()+re-insert leaving an outdated tuple that would
         # evict by the old (priority, last_freed_time) and invert the order.
         self._gen: dict[int, int] = {}
+        # (expiry, block_id) for every entry with a finite expiry, so
+        # release_expired pops only what has lapsed instead of scanning every
+        # queued entry on every allocation. A refreshed or dropped entry leaves
+        # a stale tuple behind; it is skipped when it surfaces.
+        self._expiry_heap: list[tuple[float, int]] = []
 
     # Rebuild the heap once stale tuples outnumber live entries by this much.
     _COMPACT_SLACK = 4096
@@ -99,6 +104,20 @@ class PriorityEvictionQueue:
         ]
         heapq.heapify(self._heap)
 
+    def _track_expiry(self, block_id: int) -> None:
+        """Index the entry's expiry so release_expired can find it without a
+        scan. Entries that never expire are not indexed."""
+        expiry = self._meta[block_id].expiry
+        if expiry is None:
+            return
+        heapq.heappush(self._expiry_heap, (expiry, block_id))
+        if len(self._expiry_heap) > 2 * len(self._meta) + self._COMPACT_SLACK:
+            meta = self._meta
+            self._expiry_heap = [
+                (m.expiry, bid) for bid, m in meta.items() if m.expiry is not None
+            ]
+            heapq.heapify(self._expiry_heap)
+
     def suspend(self, block: KVCacheBlock) -> None:
         """Drop the block from the eviction-candidate set (_in_queue) only;
         the sidecar (_meta) is KEPT so protection is restored on the next
@@ -127,15 +146,26 @@ class PriorityEvictionQueue:
         return None
 
     def release_expired(self) -> list[int]:
-        """Release protection from all expired entries and return their
+        """Release protection from all expired queued entries and return their
         block_ids for the caller to route to the LRU free list (expiry =
         "protection released", not "evict now"). Stale heap tuples are
-        cleaned up at the next pop_lowest."""
+        cleaned up at the next pop_lowest.
+
+        Walks the expiry heap only as far as entries that have lapsed, so an
+        allocation with nothing expired costs O(1) rather than a pass over
+        every queued entry -- with a full queue and sixteen concurrent
+        requests that pass ran once or twice per engine step and showed up as
+        +8% inter-token latency. A referenced block's lapsed entry is left for
+        try_insert, which drops it when the block is freed."""
         now = time.monotonic()
         drained: list[int] = []
-        for block_id in list(self._in_queue):
+        heap = self._expiry_heap
+        while heap and heap[0][0] <= now:
+            expiry, block_id = heapq.heappop(heap)
             meta = self._meta.get(block_id)
-            if meta is not None and meta.expiry is not None and meta.expiry <= now:
+            if meta is None or meta.expiry != expiry:
+                continue  # refreshed, replaced or dropped since it was indexed
+            if block_id in self._in_queue:
                 self._in_queue.discard(block_id)
                 self._meta.pop(block_id, None)
                 drained.append(block_id)
@@ -195,6 +225,7 @@ class PriorityEvictionQueue:
                 last_freed_time=0.0,
                 hold=True,
             )
+            self._track_expiry(block.block_id)
             held += 1
         return held
 
@@ -204,6 +235,7 @@ class PriorityEvictionQueue:
         self._heap.clear()
         self._in_queue.clear()
         self._gen.clear()
+        self._expiry_heap.clear()
 
     def apply_directives(
         self,
@@ -296,6 +328,7 @@ class PriorityEvictionQueue:
                     scope=scope,
                     last_freed_time=current.last_freed_time if current else 0.0,
                 )
+                self._track_expiry(block.block_id)
             elif current is not None and best_priority == current_priority:
                 # Equal-priority covering reuse (any scope): refresh the expiry so a
                 # shared prefix reused across sessions does not lapse. Keep the
@@ -307,6 +340,7 @@ class PriorityEvictionQueue:
                     scope=current.scope,
                     last_freed_time=current.last_freed_time,
                 )
+                self._track_expiry(block.block_id)
             elif current is not None and scope is not None and current.scope == scope:
                 # Same scope: owner may downgrade or refresh.
                 self._meta[block.block_id] = RetentionMeta(
@@ -315,6 +349,7 @@ class PriorityEvictionQueue:
                     scope=scope,
                     last_freed_time=current.last_freed_time,
                 )
+                self._track_expiry(block.block_id)
             # Non-owner downgrade: silently ignored.
 
         return released

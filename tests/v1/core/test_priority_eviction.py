@@ -43,6 +43,9 @@ def _set_meta(
         scope=scope,
         last_freed_time=last_freed,
     )
+    # Every writer of _meta indexes the expiry; release_expired walks that
+    # index instead of the queue.
+    queue._track_expiry(block.block_id)
 
 
 class TestPriorityEvictionQueue:
@@ -248,6 +251,81 @@ class TestPriorityEvictionQueue:
         assert b_live.block_id in queue._in_queue
         assert b_no_exp.block_id in queue._in_queue
         assert queue.num_blocks == 2
+
+    def test_release_expired_honours_refreshed_expiry(self, monkeypatch):
+        """A directive that extends a block's expiry supersedes the earlier one:
+        the block is not released at the old expiry and is at the new one. The
+        stale index tuple for the old expiry must be skipped, not acted on."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        directive = {"start": 0, "end": None, "priority": 50, "duration": 50.0}
+        queue.apply_directives([block], [directive], "s", 16)  # expiry 150
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 120.0)
+        queue.apply_directives([block], [directive], "s", 16)  # expiry 170
+        queue.try_insert(block)
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 160.0)
+        assert queue.release_expired() == []
+        assert block in queue
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 180.0)
+        assert queue.release_expired() == [block.block_id]
+        assert block not in queue
+        assert block.block_id not in queue._meta
+
+    def test_release_expired_leaves_referenced_block_to_try_insert(self, monkeypatch):
+        """A lapsed entry on a block that is still referenced is not the
+        pool's to route yet: release_expired leaves it and try_insert drops it
+        when the block is finally freed."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(queue, block, priority=50, expiry=150.0)  # referenced: no insert
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 200.0)
+        assert queue.release_expired() == []
+        assert block.block_id in queue._meta
+        assert queue.try_insert(block) is False
+        assert block.block_id not in queue._meta
+
+    def test_expiry_index_stays_bounded_under_refresh_churn(self, monkeypatch):
+        """Refreshing the same blocks' expiry over and over leaves one stale
+        index tuple per refresh; the index is rebuilt once stale tuples
+        dominate, so it cannot grow without bound over a long run."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(64)]
+        directive = {"start": 0, "end": None, "priority": 50, "duration": 60.0}
+        for step in range(400):
+            monkeypatch.setattr(time_mod, "monotonic", lambda s=step: 100.0 + s)
+            queue.apply_directives(blocks, [directive], "s", 16)
+        assert len(queue._expiry_heap) <= 2 * len(queue._meta) + 4096
+        for block in blocks:
+            queue.try_insert(block)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0 + 400 + 61.0)
+        assert sorted(queue.release_expired()) == list(range(64))
+        assert queue.num_blocks == 0
+
+    def test_held_blocks_expire_through_index(self, monkeypatch):
+        """hold_blocks entries carry an expiry too and must lapse the same way."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(4)]
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        assert queue.hold_blocks(blocks, priority=5, duration=10.0, limit=100) == 4
+        for block in blocks:
+            queue.try_insert(block)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 105.0)
+        assert queue.release_expired() == []
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 111.0)
+        assert sorted(queue.release_expired()) == [0, 1, 2, 3]
 
     def test_release_expired_empty_queue_is_noop(self):
         """release_expired on an empty queue returns an empty list."""
@@ -1280,17 +1358,18 @@ class TestPreemptionHold:
         assert meta is not None and meta.priority == 90 and meta.scope == "alice"
         assert block not in pq  # suspended while referenced
 
-    def test_hold_expires_when_the_request_never_returns(self):
+    def test_hold_expires_when_the_request_never_returns(self, monkeypatch):
         """Timeouts and aborts happen, so the hold cannot outlive its window."""
         import time as time_mod
 
         queue = PriorityEvictionQueue()
         block = _make_block(0)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
         queue.hold_blocks([block], priority=90, duration=20.0, limit=100)
         queue.try_insert(block)
         assert block in queue
-        # Put the expiry in the past, which is what release_expired compares.
-        queue._meta[block.block_id].expiry = time_mod.monotonic() - 1.0
+        # Move past the hold's window, which is what release_expired compares.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 121.0)
         assert queue.release_expired() == [block.block_id]
         assert block.block_id not in queue._meta
 
