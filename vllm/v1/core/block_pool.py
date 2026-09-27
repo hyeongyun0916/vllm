@@ -201,9 +201,6 @@ class BlockPool:
         # Sidecar storage for priority-based KV-cache eviction (empty until a
         # retention directive is applied).
         self.priority_eviction_queue = PriorityEvictionQueue()
-        # Fail-safe budget: the protected pool may never grow large enough to
-        # squeeze the unprotected working set into thrash. Protections beyond
-        # the budget degrade to plain LRU instead of pinning.
         self.retention_budget_blocks = int(
             num_gpu_blocks * envs.VLLM_RETENTION_BUDGET_FRAC
         )
