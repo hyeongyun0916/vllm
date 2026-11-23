@@ -1,9 +1,9 @@
 # Reproduction scripts for vllm-project/vllm#38514 (hint-free path)
 
 Evidence that a request without `kv_hints` sees the same KV-cache behaviour and cost as the PR's base commit.
-Both scripts need two vLLM source trees: the PR head and its base (`c0b6f74bee`), e.g.
+Both scripts need two vLLM source trees: the PR head and its merge base with main (`1acec5c009`), e.g.
 
-    git worktree add ../vllm-base c0b6f74bee
+    git worktree add ../vllm-base 1acec5c009
     git worktree add ../vllm-pr   <PR head>
 
 CPU only; no GPU or model weights. Use one Python env with vLLM's deps installed; `PYTHONPATH` selects the tree.
